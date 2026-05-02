@@ -21,13 +21,21 @@ async function seedData(): Promise<void> {
   await client.connect();
   try {
     const db = client.db(process.env.MONGODB_DB ?? DEFAULT_DB_NAME);
+    const now = new Date(); // Moved declaration here
 
-    for (const name of ['users', 'orders', 'knowledge', 'memories', 'sessions']) {
+    for (const name of ['users', 'orders', 'knowledge', 'memories', 'sessions', 'claims', 'source_scores', 'retrieval_log']) {
       await db.collection(name).deleteMany({});
     }
     console.info('Cleared existing data from all collections');
 
-    const now = new Date();
+    // Seed initial source_scores
+    const initialSourceScores = [
+      { domain: "wikipedia.org", score: 0.8, evaluations_count: 0, positive_contributions: 0, negative_contributions: 0, created_at: now, last_evaluated: now },
+      { domain: "nytimes.com", score: 0.7, evaluations_count: 0, positive_contributions: 0, negative_contributions: 0, created_at: now, last_evaluated: now },
+      { domain: "example.com", score: 0.3, evaluations_count: 0, positive_contributions: 0, negative_contributions: 0, created_at: now, last_evaluated: now },
+    ];
+    await db.collection('source_scores').insertMany(initialSourceScores);
+    console.info(`Inserted ${initialSourceScores.length} initial source scores`);
 
     const users = USERS.map((u) => ({ ...u, created_at: now }));
     await db.collection('users').insertMany(users);

@@ -9,12 +9,14 @@ Demonstrates five integration patterns:
 5. Session report persistence          -> on_session_end
 """
 
+from dotenv import load_dotenv
+load_dotenv(".env.local")
+
 import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-
-from dotenv import load_dotenv
+from typing import Any, Optional
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -30,18 +32,58 @@ from livekit.agents import (
     inference,
     room_io,
 )
+from livekit.agents.llm import ChatMessage, StopResponse
+from livekit.agents.voice import UserInputTranscribedEvent
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from pymongo import ReturnDocument
 from pymongo.asynchronous.database import AsyncDatabase
+from bson.objectid import ObjectId
+
+# Track agent's own corrections with timestamps to avoid loops
+# Format: {normalized_text: timestamp}
+agent_corrections = {}
+
+def normalize_text(t: str) -> str:
+    """Unified normalization for A.T.E. (lowercase alphanumeric + spaces)."""
+    return "".join(c.lower() for c in t if c.isalnum() or c.isspace()).strip()
 
 from db.client import aclose, get_db
 from tools.embeddings import embed_text
 from tools.memory import forget, list_memories, recall, remember, search_memory
+from tools.fact_checker import (
+    process_claim_for_facts,
+    reason_on_claim,
+    speak_correction,
+    set_livekit_llm_instance,
+    el_play,
+)
 
 load_dotenv(".env.local")
 
+# --- DEMO UI: ASCII ART & LOG CLEANUP ---
+def print_banner():
+    banner = r"""
+     ██████╗██╗   ██╗██████╗ ██╗██╗     
+    ██╔════╝╚██╗ ██╔╝██╔══██╗██║██║     
+    ╚█████╗  ╚████╔╝ ██████╔╝██║██║     
+     ╚═══██╗  ╚██╔╝  ██╔══██╗██║██║     
+    ██████╔╝   ██║   ██████╔╝██║███████╗
+    ╚═════╝    ╚═╝   ╚═════╝ ╚═╝╚══════╝
+    SYBIL: The Truth-Engine | May 2, 2026
+    ------------------------------------
+    """
+    print(banner)
+
+# Suppress noisy logs from standard libraries
+logging.getLogger("livekit").setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+logging.getLogger("voyage").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
 
 # Fallback identity used only when ctx.job.metadata is absent, e.g. when
 # running `uv run src/agent.py console`. The frontend always provides a
@@ -85,49 +127,56 @@ async def _vector_search_knowledge(
     return await cursor.to_list(length=limit)
 
 
+import subprocess
+
+def control_media(action: str):
+    """Robust media control for macOS Chrome/Safari."""
+    # Use 'key code 49' (Space) for a more universal toggle if JS fails
+    # But for demo precision, we target the browser directly
+    browser = "Google Chrome" # Default to Chrome
+    
+    script = f'''
+    tell application "{browser}"
+        if (count windows) > 0 then
+            execute front window's active tab javascript "var v = document.querySelector('video'); if (v) v.{action}();"
+        end if
+    end tell
+    '''
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+    except Exception:
+        pass
+
 class MongoAgent(Agent):
     """Voice agent that wires MongoDB Atlas into the LiveKit pipeline."""
 
     def __init__(
-        self, *, chat_ctx: ChatContext, user_id: str, tenant_id: str
+        self, *, chat_ctx: ChatContext, user_id: str, tenant_id: str, livekit_llm: inference.LLM
     ) -> None:
         super().__init__(
             chat_ctx=chat_ctx,
             instructions=(
-                "You are a friendly voice assistant with MongoDB-backed tools. "
-                "The user is speaking to you, so reply in plain text without "
-                "markdown, lists, or emojis. Keep replies short. "
-                "Use lookup_order to retrieve order details by id. "
-                "Use search_knowledge for any question about voice agents, "
-                "MongoDB, LiveKit, STT/LLM/TTS providers, session handling, "
-                "or related topics you are not confident answering from "
-                "prior context. Call it before answering; the tool itself "
-                "keeps the user engaged while it runs. "
-                "When the user tells you their name, email, preferred language, "
-                "or timezone, call update_profile with the matching field so it "
-                "persists in their profile. "
-                "Use remember_detail for any other fact the user volunteers, "
-                "under a short specific label like 'favorite_color', 'allergy', "
-                "or 'preferred_pronouns'. Each label is a slot and writing a "
-                "new value replaces the old one. Use recall_detail only when "
-                "you know the exact label; otherwise call search_memories with "
-                "a natural-language query. Use forget_detail to drop a slot and "
-                "list_user_memories when the user asks what you remember."
+                "You are SYBIL, an invisible background monitor. "
+                "YOU ARE NOT A CHATBOT. NEVER GENERATE TEXT. NEVER SPEAK TO THE USER. "
+                "Your internal response loop is DISABLED. "
+                "Only the background fact-checker will play pre-cached audio bytes."
             ),
         )
         self._user_id = user_id
         self._tenant_id = tenant_id
+        self._livekit_llm = livekit_llm
+        self._is_speaking_correction = False
+        self._last_spoke_at = 0.0
+        self._primary_speaker_id = None
 
     async def on_enter(self) -> None:
-        await self.session.generate_reply(
-            instructions=(
-                "Greet the user by name if the loaded profile or remembered "
-                "facts contain one. If no name is on file, briefly introduce "
-                "yourself as a MongoDB-backed voice assistant and ask the "
-                "user for their name. When they tell you, call update_profile "
-                "with field='name' so it persists for next time."
-            )
-        )
+        logger.info("SYBIL initialized in background-only mode.")
+
+    async def on_user_turn_completed(
+        self, turn_ctx: ChatContext, new_message: ChatMessage
+    ) -> None:
+        """MUZZLE: Stop any response from the agent pipeline."""
+        raise StopResponse()
 
     @function_tool()
     async def lookup_order(self, context: RunContext, order_id: str) -> str:
@@ -269,6 +318,217 @@ class MongoAgent(Agent):
         )
 
 
+async def automated_fact_check(session: AgentSession, db: AsyncDatabase, text: str, livekit_llm: inference.LLM, mongo_agent: Optional[Any] = None, fast_path_only: bool = False):
+    """Background task to identify and process factual claims from a transcript."""
+    # Use the passed mongo_agent or look it up from session
+    active_agent = mongo_agent or getattr(session, '_agent', None)
+    
+    # --- STRICT STATE GATE ---
+    if not active_agent: return
+    if active_agent._is_speaking_correction: return
+    
+    import time
+    if (time.time() - active_agent._last_spoke_at) < 5.0:
+        return
+
+    # Only log for final checks to keep logs clean
+    if not fast_path_only: logger.info(f"Automated check for transcript: {text}")
+    now = _now()
+    
+    # --- FAST-PATH: Normalized Exact Match (< 20ms) ---
+    fast_key = normalize_text(text)
+    
+    try:
+        # Check if we have an EXACT match for this normalized string
+        fast_match = await db.claims.find_one({
+            "fast_key": fast_key,
+            "status": "completed",
+            "audio_bytes": {"$exists": True}
+        })
+        
+        if fast_match:
+            print(f"\n[⚡ FAST-PATH HIT] Key: {fast_key}")
+            print(f" -> MATCH: {fast_match['text']}")
+            control_media("pause")
+            if active_agent: active_agent._is_speaking_correction = True
+            
+            # Blacklist our own correction before we say it
+            if fast_match.get("correction"):
+                agent_corrections[normalize_text(fast_match["correction"])] = time.time()
+
+            try:
+                el_play.play(fast_match["audio_bytes"])
+            finally:
+                import time
+                if active_agent:
+                    active_agent._is_speaking_correction = False
+                    active_agent._last_spoke_at = time.time()
+                
+                # Small delay before resume to allow MacBook CPU to settle
+                time.sleep(0.5) 
+                control_media("play")
+            return # EXIT IMMEDIATELY
+    except Exception as e:
+        logger.error(f"Fast-path check failed: {e}")
+
+    # If we are only doing fast-path (interim updates), exit here
+    if fast_path_only:
+        return
+
+    # --- PROACTIVE MEMORY PASS (Vector Search fallback) ---
+    try:
+        # Embed the raw transcript immediately
+        transcript_embedding = await embed_text(text)
+        
+        # Search for semantically identical verified claims
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "claims_embedding_index",
+                    "path": "embedding",
+                    "queryVector": transcript_embedding,
+                    "numCandidates": 10,
+                    "limit": 1,
+                }
+            },
+            {
+                "$match": {
+                    "status": "completed",
+                    "verdict": "False",
+                    "audio_bytes": {"$exists": True}
+                }
+            },
+            {
+                "$project": {
+                    "score": {"$meta": "vectorSearchScore"},
+                    "correction": 1,
+                    "audio_bytes": 1,
+                    "text": 1,
+                    "fast_key": 1
+                }
+            }
+        ]
+        
+        cursor = await db.claims.aggregate(pipeline)
+        results = await cursor.to_list(length=1)
+        
+        if results and results[0]["score"] > 0.95: # Increased to 0.95 for absolute precision
+            match = results[0]
+            print(f"\n[🎯 PROACTIVE HIT] Score: {match['score']:.2f}")
+            print(f" -> MATCH: {match['text']}")
+            control_media("pause")
+            
+            # Update cache with fast_key for next time
+            await db.claims.update_one(
+                {"_id": match["_id"]},
+                {"$set": {"fast_key": normalize_text(text)}}
+            )
+            
+            if active_agent: 
+                active_agent._is_speaking_correction = True
+                # Blacklist the correction so we don't fact-check our own voice
+                if match.get("correction"): 
+                    import time
+                    agent_corrections[normalize_text(match["correction"])] = time.time()
+                    logger.info(f"Blacklisted Super-Nitro correction: {match['correction']}")
+            
+            try:
+                el_play.play(match["audio_bytes"])
+            finally:
+                import time
+                if active_agent:
+                    active_agent._is_speaking_correction = False
+                    active_agent._last_spoke_at = time.time()
+                
+                # Small delay before resume
+                time.sleep(0.5)
+                control_media("play")
+                
+            return # Skip LLM extraction entirely
+            
+    except Exception as e:
+        logger.error(f"Proactive memory pass failed: {e}")
+
+    # --- LLM EXTRACTION PASS (If no proactive hit) ---
+    chat_ctx = ChatContext()
+    chat_ctx.add_message(
+        role="user",
+        content=(
+            "Analyze the following transcript segment. It may contain conversational filler and multiple factual claims: \n"
+            f"'{text}'\n\n"
+            "Task: Extract EVERY checkable factual claim. "
+            "A claim is any statement that can be verified as true or false. "
+            "Return the results as a JSON list of strings. "
+            "Example: ['London population is 9 million', 'The sky is green'] "
+            "If no claims exist, return []."
+        )
+    )
+
+    stream = livekit_llm.chat(chat_ctx=chat_ctx)
+    raw_extraction = ""
+    async for chunk in stream:
+        if chunk.delta and chunk.delta.content:
+            raw_extraction += chunk.delta.content
+    
+    # Process multiple claims
+    try:
+        # Clean up common LLM formatting issues
+        cleaned = raw_extraction.strip()
+        if "```" in cleaned: cleaned = cleaned.split("```")[1].replace("json", "").strip()
+        claims_to_check = json.loads(cleaned)
+        if not isinstance(claims_to_check, list): claims_to_check = [str(claims_to_check)]
+    except:
+        claims_to_check = []
+
+    for claim_text in claims_to_check:
+        if not claim_text or claim_text == "NO_CLAIM": continue
+        
+        print(f"\n[🔍 NEW CLAIM] {claim_text}")
+        claim_embedding = await embed_text(claim_text)
+        
+        claim_doc = {
+            "text": claim_text,
+            "fast_key": normalize_text(claim_text), # STORE THE FAST KEY
+            "embedding": claim_embedding, # STORE THE EMBEDDING
+            "timestamp_ingested": now,
+            "status": "pending",
+            "whisper_transcript_segment": text,
+            "retrieval_log_ids": [],
+            "source_domains_consulted": [],
+            "last_updated": now,
+        }
+        claim_result = await db.claims.insert_one(claim_doc)
+        
+        # Trigger fact-checking process in the background
+        asyncio.create_task(process_claim_for_facts(db, claim_result.inserted_id, livekit_llm, active_agent))
+
+
+async def check_and_resume_incomplete_claims(db: AsyncDatabase, livekit_llm: inference.LLM, mongo_agent: Optional[Any] = None):
+    logger.info("Checking for and resuming incomplete claims...")
+    incomplete_statuses = ["pending", "retrieving", "reasoning", "speaking", "failed_speaking"]
+    cursor = db.claims.find({"status": {"$in": incomplete_statuses}})
+
+    async for claim in cursor:
+        claim_id = claim["_id"]
+        status = claim["status"]
+        logger.info(f"Resuming claim {claim_id} with status: {status}")
+
+        # Trigger the appropriate function based on status
+        if status == "pending":
+            asyncio.create_task(process_claim_for_facts(db, claim_id, livekit_llm, mongo_agent))
+        elif status == "retrieving": # If it was retrieving, restart fact checking
+            asyncio.create_task(process_claim_for_facts(db, claim_id, livekit_llm, mongo_agent))
+        elif status == "reasoning":
+            asyncio.create_task(reason_on_claim(db, claim_id, livekit_llm, mongo_agent))
+        elif status == "failed_speaking":
+            # Correction failed previously. Don't auto-retry at startup to avoid backlog dump.
+            logger.info(f"Claim {claim_id} previously failed speaking; skipping auto-resume.")
+            pass
+        elif status == "speaking" and claim.get("correction"): # Only speak if correction exists
+            asyncio.create_task(speak_correction(db, claim_id, claim["correction"], mongo_agent))
+    logger.info("Finished checking for incomplete claims.")
+
+
 async def preload_user(user_id: str, tenant_id: str) -> ChatContext:
     """Pattern 3: load user data into the chat context before the session.
 
@@ -367,15 +627,12 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent", on_session_end=on_session_end)
 async def my_agent(ctx: JobContext) -> None:
+    print_banner()
     ctx.log_context_fields = {"room": ctx.room.name}
 
     # Pattern 3 setup: identify the user from agent dispatch metadata.
-    # The frontend packs {"user_id", "tenant_id"} into ctx.job.metadata via
-    # room_config.agents[0].metadata. Parsing here (before ctx.connect) keeps
-    # the preload network call out of the connection critical path. See:
-    # https://docs.livekit.io/agents/logic/external-data/
     meta: dict[str, str] = {}
-    if ctx.job.metadata:
+    if hasattr(ctx, 'job') and getattr(ctx, 'job', None) and ctx.job.metadata:
         try:
             meta = json.loads(ctx.job.metadata)
         except json.JSONDecodeError:
@@ -385,6 +642,8 @@ async def my_agent(ctx: JobContext) -> None:
     tenant_id = meta.get("tenant_id", DEFAULT_TENANT_ID)
     ctx.proc.userdata["user_id"] = user_id
     ctx.proc.userdata["tenant_id"] = tenant_id
+
+    await ctx.connect()
 
     initial_ctx = await preload_user(user_id, tenant_id)
 
@@ -401,12 +660,53 @@ async def my_agent(ctx: JobContext) -> None:
         ),
     )
 
+    # Initialize the agent instance early so we can use its state
+    mongo_agent = MongoAgent(
+        chat_ctx=initial_ctx,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        livekit_llm=session.llm,
+    )
+    # Stash the agent instance on the session for event listeners to find
+    setattr(session, '_agent', mongo_agent)
+
+    # Get DB instance here to pass to resume claims function
+    db_instance = await get_db()
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(ev: UserInputTranscribedEvent):
+        if not ev.transcript:
+            return
+
+        import time
+        now = time.time()
+        
+        # 1. Voice-Set Identity (Denoising)
+        identity = ev.speaker_id
+        if mongo_agent._primary_speaker_id is None and identity:
+            mongo_agent._primary_speaker_id = identity
+            logger.info(f"Primary speaker identified: {identity}")
+        
+        if identity and identity != mongo_agent._primary_speaker_id:
+            return
+
+        # 2. State & Cooldown
+        if mongo_agent._is_speaking_correction: return
+        if (now - mongo_agent._last_spoke_at) < 4.0: return
+
+        # 3. Hybrid Strategy
+        if not ev.is_final:
+            # FAST-PATH ONLY for speed
+            asyncio.create_task(automated_fact_check(session, db_instance, ev.transcript, session.llm, mongo_agent, fast_path_only=True))
+        else:
+            # FULL-CHECK for precision
+            asyncio.create_task(automated_fact_check(session, db_instance, ev.transcript, session.llm, mongo_agent, fast_path_only=False))
+
+    # Check and resume any incomplete claims from previous runs in the background
+    asyncio.create_task(check_and_resume_incomplete_claims(db_instance, session.llm, mongo_agent))
+
     await session.start(
-        agent=MongoAgent(
-            chat_ctx=initial_ctx,
-            user_id=user_id,
-            tenant_id=tenant_id,
-        ),
+        agent=mongo_agent,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -417,8 +717,7 @@ async def my_agent(ctx: JobContext) -> None:
         ),
     )
 
-    await ctx.connect()
-
 
 if __name__ == "__main__":
+    print_banner()
     cli.run_app(server)

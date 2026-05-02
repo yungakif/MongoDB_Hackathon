@@ -83,15 +83,28 @@ async function createIndexes(): Promise<void> {
     const existing = new Set(
       (await db.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name),
     );
-    for (const name of ['users', 'orders', 'sessions', 'knowledge', 'memories']) {
-      if (!existing.has(name)) {
-        await db.createCollection(name);
-        console.info(`${name}: collection created`);
-      }
-    }
+     for (const name of ['users', 'orders', 'sessions', 'knowledge', 'memories', 'claims', 'source_scores', 'retrieval_log']) {
+       if (!existing.has(name)) {
+         await db.createCollection(name);
+         console.info(`${name}: collection created`);
+       }
+     }
 
-    await db.collection('users').createIndex({ user_id: 1 }, { unique: true });
-    console.info('users: user_id unique index ready');
+     // New A.T.E. collections and their indexes
+     await db.collection('claims').createIndex({ status: 1 });
+     await db.collection('claims').createIndex({ timestamp_ingested: 1 });
+     await db.collection('claims').createIndex({ text: 1 });
+     console.info('claims: status, timestamp_ingested, text indexes ready');
+
+     await db.collection('source_scores').createIndex({ domain: 1 }, { unique: true });
+     console.info('source_scores: domain unique index ready');
+
+     await db.collection('retrieval_log').createIndex({ claim_id: 1 });
+     await db.collection('retrieval_log').createIndex({ timestamp_attempted: 1 });
+     console.info('retrieval_log: claim_id, timestamp_attempted indexes ready');
+
+     await db.collection('users').createIndex({ user_id: 1 }, { unique: true });
+     console.info('users: user_id unique index ready');
 
     await db.collection('orders').createIndex({ order_id: 1 }, { unique: true });
     await db.collection('orders').createIndex({ user_id: 1 });
@@ -113,6 +126,7 @@ async function createIndexes(): Promise<void> {
       { collection: 'knowledge', spec: vectorIndex('knowledge_embedding_index') },
       { collection: 'memories', spec: vectorIndex('memories_embedding_index') },
       { collection: 'memories', spec: memoriesTextIndex() },
+      { collection: 'claims', spec: vectorIndex('claims_embedding_index') },
     ];
     for (const { collection, spec } of searchIndexes) {
       try {
